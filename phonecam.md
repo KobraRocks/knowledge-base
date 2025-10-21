@@ -253,3 +253,184 @@ sudo modprobe -r v4l2loopback || true
 ---
 
 **Enjoy your high‑quality Android webcam on Arch!** 📷
+
+## 9) Optional: Auto‑Rotation + Processed Virtual Cam
+
+This adds a second virtual camera `/dev/video20` that always appears **upright**. It watches the phone’s rotation over ADB and restarts a tiny `ffmpeg` filter chain when the orientation changes.
+
+### Install extra tool
+
+```bash
+sudo pacman -S ffmpeg
+```
+
+### Ensure two loopback devices at boot
+
+(If you used step 6 already, update it to have 2 devices.)
+
+```bash
+sudo tee /etc/modprobe.d/v4l2loopback.conf >/dev/null <<'EOF'
+options v4l2loopback devices=2 video_nr=10,20 exclusive_caps=1,1 card_label="PhoneWebcam,ProcessedCam"
+EOF
+
+# reload once (or reboot)
+sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+v4l2-ctl --list-devices
+```
+
+### Script: `phonecam-autorotate.sh`
+
+This script starts scrcpy → `/dev/video10`, then maintains a processed, upright feed on `/dev/video20`.
+
+```bash
+sudo tee /usr/local/bin/phonecam-autorotate.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IN_DEV=/dev/video10
+OUT_DEV=/dev/video20
+LABEL_IN="PhoneWebcam"
+LABEL_OUT="ProcessedCam"
+
+cleanup() {
+  [[ -n "${FF_PID:-}" ]] && kill "$FF_PID" 2>/dev/null || true
+  [[ -n "${SCRCPY_PID:-}" ]] && kill "$SCRCPY_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Make sure adb is ready and device is authorized
+adb start-server >/dev/null || true
+
+echo "Waiting for device (authorize on phone if prompted)…"
+adb wait-for-device
+
+if ! adb devices | awk 'NR>1{print $2}' | grep -qx device; then
+  echo "❌ ADB device not authorized (check phone screen)." >&2
+  exit 1
+fi
+
+# Ensure v4l2loopback with 2 devices exists
+if ! lsmod | grep -q '^v4l2loopback'; then
+  sudo modprobe v4l2loopback devices=2 video_nr=10,20 exclusive_caps=1,1 \
+    card_label="${LABEL_IN},${LABEL_OUT}"
+fi
+
+# Start the phone camera → /dev/video10 (rear cam id may vary)
+scrcpy --video-source=camera \
+  --camera-id=1 \
+  --camera-ar=16:9 -m2560 \
+  --camera-fps=30 \
+  --video-codec=h264 --video-bit-rate=6M \
+  --v4l2-sink="$IN_DEV" \
+  --no-audio --no-control &
+SCRCPY_PID=$!
+
+echo "Started scrcpy (pid=$SCRCPY_PID) → $IN_DEV"
+
+# Map Android SurfaceOrientation -> ffmpeg rotation filter
+# Adjust if your device reports different numbers.
+map_filter() {
+  case "$1" in
+    0) echo "null" ;;                                               # natural
+    1) echo "transpose=clock" ;;                                    # 90°
+    2) echo "transpose=cclock,transpose=cclock" ;;                  # 180°
+    3) echo "transpose=cclock" ;;                                   # 270°
+    *) echo "null" ;;
+  esac
+}
+
+restart_ffmpeg() {
+  local vf="$1"
+  [[ -n "${FF_PID:-}" ]] && kill "$FF_PID" 2>/dev/null || true
+  echo "Starting ffmpeg filter: $vf"
+  ffmpeg -nostdin -loglevel warning -fflags nobuffer \
+    -f v4l2 -i "$IN_DEV" \
+    -vf "$vf,scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+    -pix_fmt yuv420p -f v4l2 "$OUT_DEV" &
+  FF_PID=$!
+}
+
+CURR=""
+# Prime with current orientation (might be empty for a split second)
+ORI=$(adb shell "dumpsys window | grep -i SurfaceOrientation" | awk -F= '{print $2}' | tr -d '
+' || true)
+[ -z "$ORI" ] && ORI=1
+restart_ffmpeg "$(map_filter "$ORI")"
+
+# Watch for changes
+while sleep 0.7; do
+  ORI=$(adb shell "dumpsys window | grep -i SurfaceOrientation" | awk -F= '{print $2}' | tr -d '
+' || true)
+  [ -z "$ORI" ] && continue
+  [[ "$ORI" == "$CURR" ]] && continue
+  CURR="$ORI"
+  echo ">> Orientation changed: $CURR"
+  restart_ffmpeg "$(map_filter "$CURR")"
+
+done
+EOF
+
+sudo chmod +x /usr/local/bin/phonecam-autorotate.sh
+```
+
+**Usage:**
+
+```bash
+phonecam-autorotate.sh
+```
+
+Then select **ProcessedCam (/dev/video20)** in your video app.
+
+### Optional: systemd user service
+
+Start/stop with `systemctl --user` and get logs.
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/phonecam-autorotate.service <<'UNIT'
+[Unit]
+Description=Android phone → upright webcam (/dev/video20)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/phonecam-autorotate.sh
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+
+# enable for login sessions
+systemctl --user daemon-reload
+systemctl --user enable phonecam-autorotate.service
+# start it when your phone is connected & authorized
+systemctl --user start phonecam-autorotate.service
+journalctl --user -u phonecam-autorotate -f
+```
+
+### Optional: trigger on USB plug-in (udev)
+
+Replace `2ae5` with your phone’s vendor id (`lsusb`), and `USERNAME` with your user:
+
+```bash
+sudo tee /etc/udev/rules.d/99-phonecam-autorotate.rules >/dev/null <<'EOF'
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2ae5", \
+  RUN+="/usr/bin/runuser -l USERNAME -c 'systemctl --user start phonecam-autorotate.service'"
+EOF
+
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+> If you use the udev method, ensure your user is allowed to run user services without a graphical session (enable lingering once):
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+### Notes
+
+* The orientation mapping may differ per device; watch the log lines (e.g., `>> Orientation changed: 1`) and tweak `map_filter()` if needed.
+* For lowest latency, keep resolutions modest and avoid heavy filters.
+* You can add color/zoom filters into the same ffmpeg line inside `restart_ffmpeg()` (e.g., `eq=…,zoompan=…`).
